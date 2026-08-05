@@ -1,0 +1,36 @@
+---
+- name: Check whether this node has already joined
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: _kubelet_conf
+
+- name: Determine the control plane host for this cluster
+  ansible.builtin.set_fact:
+    _cp_host: "{{ (groups['cluster1_cp'] if cluster_name == 'cluster-1' else groups['cluster2_cp'])[0] }}"
+
+- name: Join the cluster
+  ansible.builtin.command: >-
+    {{ hostvars[_cp_host]['kube_join_command'] }}
+    --node-name {{ inventory_hostname }}
+    --cri-socket unix:///run/containerd/containerd.sock
+  when: not _kubelet_conf.stat.exists
+  changed_when: true
+  register: _join
+  retries: 2
+  delay: 20
+  until: _join is succeeded
+
+- name: Wait for the node to register as Ready
+  ansible.builtin.command: >-
+    kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+  environment: {KUBECONFIG: /root/.kube/config}
+  delegate_to: "{{ _cp_host }}"
+  changed_when: false
+
+- name: Label the node with its worker role
+  ansible.builtin.command: >-
+    kubectl label node {{ inventory_hostname }}
+    node-role.kubernetes.io/worker=worker --overwrite
+  environment: {KUBECONFIG: /root/.kube/config}
+  delegate_to: "{{ _cp_host }}"
+  changed_when: false

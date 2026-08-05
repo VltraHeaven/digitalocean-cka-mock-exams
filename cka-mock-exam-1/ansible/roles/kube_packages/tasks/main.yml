@@ -1,0 +1,142 @@
+---
+# Each node gets the repository for the stream it should run. Every node uses
+# kube_stream except the designated skew node, which lags behind for Task 3.
+- name: Decide which release stream this node runs
+  ansible.builtin.set_fact:
+    node_stream: "{{ kube_skew_stream if inventory_hostname == kube_skew_node else kube_stream }}"
+
+- name: Create the apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Fetch the pkgs.k8s.io signing key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ node_stream }}/deb/Release.key"
+    dest: /tmp/kubernetes-release.key
+    mode: "0644"
+  retries: 3
+  delay: 5
+
+- name: Install the dearmoured signing key
+  ansible.builtin.shell: |
+    gpg --batch --yes --dearmor \
+      -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add the Kubernetes apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    mode: "0644"
+    content: >
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg]
+      https://pkgs.k8s.io/core:/stable:/v{{ node_stream }}/deb/ /
+  register: _kube_repo
+
+- name: Refresh the package index
+  ansible.builtin.apt:
+    update_cache: true
+  when: _kube_repo.changed
+  retries: 3
+  delay: 10
+
+# Resolving the patch version at runtime keeps the lab building correctly as
+# new patches ship. The skew node deliberately takes the OLDEST patch still
+# published in its stream so there is always something to upgrade.
+- name: Resolve the target kubeadm package version
+  ansible.builtin.shell: |
+    set -o pipefail
+    if [ "{{ 'skew' if inventory_hostname == kube_skew_node else 'current' }}" = "skew" ]; then
+      apt-cache madison kubeadm | awk '{print $3}' | tail -1
+    else
+      apt-cache madison kubeadm | awk '{print $3}' | head -1
+    fi
+  args:
+    executable: /bin/bash
+  register: _kube_pkg_version
+  changed_when: false
+
+- name: Fail early if no package version could be resolved
+  ansible.builtin.assert:
+    that:
+      - _kube_pkg_version.stdout | length > 0
+    fail_msg: >-
+      No kubeadm package found in stream v{{ node_stream }}. That stream may be
+      end-of-life and removed from pkgs.k8s.io. Set kube_stream in
+      group_vars/all.yml to a currently supported minor version.
+
+- name: Record the resolved version
+  ansible.builtin.set_fact:
+    kube_pkg_version: "{{ _kube_pkg_version.stdout | trim }}"
+
+- name: Confirm the skew node actually has an upgrade available
+  when: inventory_hostname == kube_skew_node
+  block:
+    - name: Look up the newest patch in the stream
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache madison kubeadm | awk '{print $3}' | head -1
+      args:
+        executable: /bin/bash
+      register: _newest_pkg
+      changed_when: false
+
+    - name: Assert there is something for Task 3 to upgrade to
+      ansible.builtin.assert:
+        that:
+          - (_newest_pkg.stdout | trim) != kube_pkg_version
+        fail_msg: >-
+          Stream v{{ node_stream }} publishes only one patch release
+          ({{ kube_pkg_version }}), so Task 3 has no upgrade target. Either set
+          kube_skew_stream to the previous minor version in group_vars/all.yml,
+          or drop Task 3 from the exam.
+        success_msg: >-
+          Task 3 armed: {{ kube_skew_node }} on {{ kube_pkg_version }},
+          upgrade target {{ _newest_pkg.stdout | trim }}
+
+- name: Show which version this node will run
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} -> stream v{{ node_stream }}, package {{ kube_pkg_version }}"
+
+- name: Unhold Kubernetes packages before installing
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: install
+  loop: [kubeadm, kubelet, kubectl]
+  failed_when: false
+
+- name: Install kubeadm, kubelet and kubectl at the resolved version
+  ansible.builtin.apt:
+    name:
+      - "kubeadm={{ kube_pkg_version }}"
+      - "kubelet={{ kube_pkg_version }}"
+      - "kubectl={{ kube_pkg_version }}"
+    state: present
+    allow_downgrade: true
+    allow_change_held_packages: true
+  register: _kube_install
+  retries: 3
+  delay: 10
+  until: _kube_install is succeeded
+
+- name: Hold the Kubernetes packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [kubeadm, kubelet, kubectl]
+
+- name: Enable the kubelet
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+    daemon_reload: true
+
+- name: Tell the kubelet which address to advertise
+  ansible.builtin.copy:
+    dest: /etc/default/kubelet
+    mode: "0644"
+    content: |
+      KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+  notify: Restart kubelet

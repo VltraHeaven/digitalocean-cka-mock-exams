@@ -1,0 +1,20 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+.terraform.lock.hcl
+
+# Ansible
+**/ansible/inventory.ini
+*.retry
+
+# Kubernetes
+**/kubeconfig
+
+# General
+.DS_Store
+.env
+*.pem
+*.key

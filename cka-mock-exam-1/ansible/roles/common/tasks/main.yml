@@ -1,0 +1,135 @@
+---
+- name: Set hostname to the Kubernetes node name
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Ensure lab directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ exam_answer_dir }}"
+    - "{{ backup_dir }}"
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - jq
+      - vim
+      - bash-completion
+      - socat
+      - conntrack
+      - ethtool
+      - iproute2
+      - iptables
+      - nfs-common
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  register: _apt_base
+  retries: 3
+  delay: 10
+  until: _apt_base is succeeded
+
+# ---------------------------------------------------------------------------
+# Name resolution between nodes
+# ---------------------------------------------------------------------------
+- name: Install the Terraform-generated /etc/hosts fragment
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} CKA LAB NODES"
+    block: "{{ lookup('file', 'etc_hosts_fragment') }}"
+
+# ---------------------------------------------------------------------------
+# Swap — kubelet refuses to start with swap enabled unless explicitly permitted
+# ---------------------------------------------------------------------------
+- name: Disable swap for the current boot
+  ansible.builtin.command: swapoff -a
+  changed_when: false
+  failed_when: false
+
+- name: Remove swap entries from /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '# \1'
+
+- name: Mask any systemd-managed swap units (Ubuntu ships a swapfile unit)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+    masked: true
+  loop:
+    - swap.target
+    - "swap.img.swap"
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Kernel modules and sysctls required by the CNI and kube-proxy
+# ---------------------------------------------------------------------------
+- name: Persist required kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    mode: "0644"
+    content: |
+      overlay
+      br_netfilter
+
+- name: Load kernel modules now
+  # Deliberately ansible.builtin only: no external collections to install.
+  ansible.builtin.command: "modprobe {{ item }}"
+  loop:
+    - overlay
+    - br_netfilter
+  changed_when: false
+
+- name: Persist required sysctl settings
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/k8s.conf
+    mode: "0644"
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+  notify: Reload sysctl
+
+- name: Apply sysctl settings immediately
+  ansible.builtin.command: sysctl --system
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# Quality of life for whoever is sitting the exam
+# ---------------------------------------------------------------------------
+- name: Configure the root shell for kubectl work
+  ansible.builtin.blockinfile:
+    path: /root/.bashrc
+    marker: "# {mark} CKA LAB"
+    block: |
+      alias k=kubectl
+      export EDITOR=vim
+      export do='--dry-run=client -o yaml'
+      export now='--force --grace-period=0'
+      source <(kubectl completion bash) 2>/dev/null
+      complete -o default -F __start_kubectl k 2>/dev/null
+      export PS1='\[\e[1;32m\]\h\[\e[0m\]:\w# '
+    create: true
+    mode: "0644"
+
+- name: Set vim defaults for YAML editing
+  ansible.builtin.copy:
+    dest: /root/.vimrc
+    mode: "0644"
+    content: |
+      set number
+      set expandtab
+      set tabstop=2
+      set shiftwidth=2
+      set softtabstop=2
+      set paste
+      syntax on

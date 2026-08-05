@@ -1,0 +1,72 @@
+---
+# Namespaces the exam expects to already exist.
+# `build` and `shop` are deliberately absent: Tasks 2 and 4 create them.
+apiVersion: v1
+kind: Namespace
+metadata: {name: ml}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: billing}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: retail}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: checkout}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: analytics}
+---
+# --------------------------------------------------------------------------
+# Task 9 — rollout / rollback subject. Starts on 1.24 with the default
+# strategy so the candidate has to set maxSurge/maxUnavailable themselves.
+# --------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storefront
+  namespace: retail
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: storefront}
+  template:
+    metadata:
+      labels: {app: storefront}
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.24
+          ports:
+            - containerPort: 80
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+---
+# --------------------------------------------------------------------------
+# Task 16 — healthy backend. The Service that fronts it is created broken by
+# break.yml (tag: endpoints).
+# --------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: checkout
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: checkout}
+  template:
+    metadata:
+      labels: {app: checkout}
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}

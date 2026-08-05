@@ -1,0 +1,152 @@
+---
+# Creates everything the exam expects to find already working.
+# Run after site.yml, before break.yml.
+#
+#   ansible-playbook exam-setup.yml
+
+- name: cluster-1 prerequisites
+  hosts: cluster1_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Stage the cluster-1 manifests
+      ansible.builtin.copy:
+        src: cluster1-setup.yaml
+        dest: /root/cluster1-setup.yaml
+        mode: "0644"
+
+    - name: Apply the cluster-1 manifests
+      ansible.builtin.command: kubectl --context cluster-1-admin@cluster-1 apply -f /root/cluster1-setup.yaml
+      changed_when: true
+
+    - name: Wait for the storefront rollout
+      ansible.builtin.command: >-
+        kubectl --context cluster-1-admin@cluster-1 -n retail rollout status deploy/storefront --timeout=180s
+      changed_when: false
+
+    - name: Wait for the checkout rollout
+      ansible.builtin.command: >-
+        kubectl --context cluster-1-admin@cluster-1 -n checkout rollout status deploy/checkout --timeout=180s
+      changed_when: false
+
+    - name: Create the answer directory
+      ansible.builtin.file:
+        path: "{{ exam_answer_dir }}"
+        state: directory
+        mode: "0755"
+
+- name: cluster-2 prerequisites
+  hosts: cluster2_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Stage the cluster-2 manifests
+      ansible.builtin.copy:
+        src: cluster2-setup.yaml
+        dest: /root/cluster2-setup.yaml
+        mode: "0644"
+
+    - name: Apply the cluster-2 manifests
+      ansible.builtin.command: kubectl --context cluster-2-admin@cluster-2 apply -f /root/cluster2-setup.yaml
+      changed_when: true
+
+    - name: Wait for the networking subjects to be ready
+      ansible.builtin.command: >-
+        kubectl --context cluster-2-admin@cluster-2 -n {{ item.ns }} rollout status deploy/{{ item.name }} --timeout=180s
+      loop:
+        - {ns: payments,  name: ledger}
+        - {ns: payments,  name: frontend}
+        - {ns: payments,  name: scanner}
+        - {ns: inventory, name: stock-api}
+      loop_control:
+        label: "{{ item.ns }}/{{ item.name }}"
+      changed_when: false
+
+    # ----------------------------------------------------------------------
+    # Task 5 — the Kustomize base the candidate must overlay
+    # ----------------------------------------------------------------------
+    - name: Create the Kustomize base directory
+      ansible.builtin.file:
+        path: /opt/cka/kustomize/base
+        state: directory
+        mode: "0755"
+
+    - name: Write the base Deployment
+      ansible.builtin.copy:
+        dest: /opt/cka/kustomize/base/deployment.yaml
+        mode: "0644"
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: catalog
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: catalog
+            template:
+              metadata:
+                labels:
+                  app: catalog
+              spec:
+                containers:
+                  - name: catalog
+                    image: nginx:1.24
+                    ports:
+                      - containerPort: 80
+                    resources:
+                      requests:
+                        cpu: 25m
+                        memory: 32Mi
+
+    - name: Write the base Service
+      ansible.builtin.copy:
+        dest: /opt/cka/kustomize/base/service.yaml
+        mode: "0644"
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: catalog
+          spec:
+            selector:
+              app: catalog
+            ports:
+              - port: 80
+                targetPort: 80
+
+    - name: Write the base kustomization
+      ansible.builtin.copy:
+        dest: /opt/cka/kustomize/base/kustomization.yaml
+        mode: "0644"
+        content: |
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - deployment.yaml
+            - service.yaml
+
+    - name: Make sure the overlays directory exists but is empty
+      ansible.builtin.file:
+        path: /opt/cka/kustomize/overlays
+        state: directory
+        mode: "0755"
+
+    - name: Create the answer directory
+      ansible.builtin.file:
+        path: "{{ exam_answer_dir }}"
+        state: directory
+        mode: "0755"
+
+- name: Confirm the lab is armed
+  hosts: cluster1_cp
+  gather_facts: false
+  tasks:
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Exam prerequisites are in place."
+          - "Now inject the faults:  ansible-playbook break.yml"

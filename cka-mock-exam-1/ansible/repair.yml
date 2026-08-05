@@ -1,0 +1,171 @@
+---
+# Restores any broken component to its healthy state. Use it to reset the lab
+# between attempts, or to unblock yourself if a task defeats you.
+#
+#   ansible-playbook repair.yml               # fix everything
+#   ansible-playbook repair.yml -t apiserver  # fix one thing
+#
+# Tags: apiserver kubelet skew endpoints crashloop pvc scoring
+
+- name: Restore the cluster-2 API server
+  hosts: cluster2_cp
+  gather_facts: false
+  tags: [apiserver]
+  tasks:
+    - name: Check for a backup manifest
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}/kube-apiserver.yaml"
+      register: _bak
+
+    - name: Restore from backup
+      ansible.builtin.copy:
+        src: "{{ backup_dir }}/kube-apiserver.yaml"
+        dest: /etc/kubernetes/manifests/kube-apiserver.yaml
+        remote_src: true
+        mode: "0600"
+      when: _bak.stat.exists
+
+    - name: Otherwise repair the flag in place
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '--client-ca-file=\S+'
+        replace: '--client-ca-file=/etc/kubernetes/pki/ca.crt'
+      when: not _bak.stat.exists
+
+    - name: Wait for the API server to answer again
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ node_ip }}"
+        state: started
+        timeout: 240
+
+- name: Restore the kubelet on c1-node-1
+  hosts: c1-node-1
+  gather_facts: false
+  tags: [kubelet]
+  tasks:
+    - name: Check for a backup config
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}/kubelet-config.yaml"
+      register: _kbak
+
+    - name: Restore the kubelet config
+      ansible.builtin.copy:
+        src: "{{ backup_dir }}/kubelet-config.yaml"
+        dest: /var/lib/kubelet/config.yaml
+        remote_src: true
+        mode: "0600"
+      when: _kbak.stat.exists
+
+    - name: Restart the kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for the kubelet to come up
+      ansible.builtin.command: systemctl is-active kubelet
+      register: _kact
+      until: _kact.stdout == "active"
+      retries: 12
+      delay: 5
+      changed_when: false
+
+- name: Bring the skew node up to the current version
+  hosts: c1-node-2          # must be literal: `hosts` is parsed before group_vars load
+  gather_facts: false
+  tags: [skew, never]
+  tasks:
+    - name: Resolve the newest available patch
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache madison kubeadm | awk '{print $3}' | head -1
+      args: {executable: /bin/bash}
+      register: _new_ver
+      changed_when: false
+
+    - name: Unhold
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop: [kubeadm, kubelet, kubectl]
+
+    - name: Upgrade the packages
+      ansible.builtin.apt:
+        name:
+          - "kubeadm={{ _new_ver.stdout | trim }}"
+          - "kubelet={{ _new_ver.stdout | trim }}"
+          - "kubectl={{ _new_ver.stdout | trim }}"
+        state: present
+        allow_change_held_packages: true
+
+    - name: Run kubeadm upgrade node
+      ansible.builtin.command: kubeadm upgrade node
+      changed_when: true
+      failed_when: false
+
+    - name: Re-hold
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubeadm, kubelet, kubectl]
+
+    - name: Restart the kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+
+- name: Reset cluster-1 objects
+  hosts: cluster1_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Uncordon every cluster-1 node
+      ansible.builtin.shell: |
+        kubectl --context cluster-1-admin@cluster-1 get nodes -o name | xargs -r -n1 kubectl --context cluster-1-admin@cluster-1 uncordon
+        true
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [skew, kubelet]
+
+    - name: Delete the broken Service
+      ansible.builtin.command: >-
+        kubectl --context cluster-1-admin@cluster-1 -n checkout delete svc checkout-svc --ignore-not-found
+      changed_when: true
+      tags: [endpoints]
+
+    - name: Delete the CrashLoopBackOff workload
+      ansible.builtin.shell: |
+        kubectl --context cluster-1-admin@cluster-1 -n analytics delete deploy reporting --ignore-not-found
+        kubectl --context cluster-1-admin@cluster-1 -n analytics delete cm reporting-config --ignore-not-found
+        kubectl --context cluster-1-admin@cluster-1 delete ns loadgen --ignore-not-found --wait=false
+        true
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [crashloop]
+
+    - name: Clear recorded answers
+      ansible.builtin.file:
+        path: "{{ exam_answer_dir }}"
+        state: absent
+      tags: [scoring, never]
+
+- name: Reset cluster-2 objects
+  hosts: cluster2_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Remove PersistentVolumes created during an attempt
+      ansible.builtin.shell: |
+        kubectl --context cluster-2-admin@cluster-2 delete pv logs-pv local-pv-a --ignore-not-found
+        kubectl --context cluster-2-admin@cluster-2 delete sc local-delayed --ignore-not-found
+        kubectl --context cluster-2-admin@cluster-2 -n default delete pod consumer --ignore-not-found
+        kubectl --context cluster-2-admin@cluster-2 -n default delete pvc app-data --ignore-not-found
+        true
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [pvc]

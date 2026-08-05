@@ -1,0 +1,286 @@
+---
+# Injects the exam faults. Every fault is tagged so a single task can be
+# re-armed for another attempt without rebuilding the lab.
+#
+#   ansible-playbook break.yml                  # arm everything
+#   ansible-playbook break.yml -t crashloop     # re-arm Task 17 only
+#
+# Tags: apiserver kubelet skew endpoints crashloop pvc
+#
+# Ordering note: the cluster-2 API server is broken LAST, because every other
+# cluster-2 fault is applied through that same API server.
+
+# ===========================================================================
+# cluster-1 object-level faults
+# ===========================================================================
+- name: cluster-1 faults
+  hosts: cluster1_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+
+    # ---- Task 16: Service with a wrong selector AND a wrong targetPort ----
+    - name: Create the broken checkout Service
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl --context cluster-1-admin@cluster-1 apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: checkout-svc
+          namespace: checkout
+        spec:
+          type: ClusterIP
+          selector:
+            app: checkout-api      # pods are labelled app=checkout
+          ports:
+            - name: http
+              port: 80
+              targetPort: 8080     # container listens on 80
+              protocol: TCP
+        EOF
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [endpoints]
+
+    # ---- Task 17: CrashLoopBackOff from a ConfigMap key mismatch ----------
+    - name: Create the broken reporting workload
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl --context cluster-1-admin@cluster-1 apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: reporting-config
+          namespace: analytics
+        data:
+          app.config: |          # the pod reads app.conf
+            interval=60
+            sink=stdout
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: reporting
+          namespace: analytics
+        spec:
+          replicas: 1
+          selector:
+            matchLabels: {app: reporting}
+          template:
+            metadata:
+              labels: {app: reporting}
+            spec:
+              containers:
+                - name: reporting
+                  image: busybox:1.36
+                  command: ["/bin/sh","-c","cat /config/app.conf && sleep 3600"]
+                  volumeMounts:
+                    - name: config
+                      mountPath: /config
+                  resources:
+                    requests: {cpu: 10m, memory: 16Mi}
+              volumes:
+                - name: config
+                  configMap:
+                    name: reporting-config
+        EOF
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [crashloop]
+
+    - name: Give the reporting pod time to enter CrashLoopBackOff
+      ansible.builtin.pause:
+        seconds: 25
+      tags: [crashloop]
+
+    # ---- A little background load so `kubectl top` has a clear winner -----
+    - name: Deploy a memory-hungry pod so Task 17B has a stable answer
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl --context cluster-1-admin@cluster-1 apply -f -
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: loadgen}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: memory-hog
+          namespace: loadgen
+        spec:
+          containers:
+            - name: hog
+              image: busybox:1.36
+              command:
+                - /bin/sh
+                - -c
+                - "dd if=/dev/zero of=/ram/ballast bs=1M count=300 2>/dev/null; sleep 36000"
+              volumeMounts:
+                - name: ram
+                  mountPath: /ram
+              resources:
+                requests: {cpu: 10m, memory: 64Mi}
+                limits:   {memory: 512Mi}
+          volumes:
+            # Memory-medium emptyDir is tmpfs; tmpfs pages are charged to the
+            # pod cgroup, so this shows up in `kubectl top` as roughly 300Mi.
+            - name: ram
+              emptyDir:
+                medium: Memory
+                sizeLimit: 512Mi
+        EOF
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [crashloop]
+
+# ===========================================================================
+# cluster-2 object-level faults
+# ===========================================================================
+- name: cluster-2 faults
+  hosts: cluster2_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Remove any PersistentVolume that would satisfy logs-pvc
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl --context cluster-2-admin@cluster-2 get pv -o jsonpath='{range .items[?(@.spec.storageClassName=="local-fast")]}{.metadata.name}{"\n"}{end}' \
+          | xargs -r kubectl --context cluster-2-admin@cluster-2 delete pv --wait=false
+        true
+      args: {executable: /bin/bash}
+      changed_when: true
+      tags: [pvc]
+
+    - name: Confirm logs-pvc is Pending
+      ansible.builtin.command: >-
+        kubectl --context cluster-2-admin@cluster-2 \
+          -n observability get pvc logs-pvc -o jsonpath={.status.phase}
+      register: _pvc_phase
+      changed_when: false
+      failed_when: false
+      tags: [pvc]
+
+    - name: Report the claim state
+      ansible.builtin.debug:
+        msg: "logs-pvc is {{ _pvc_phase.stdout | default('missing') }} (expected Pending)"
+      tags: [pvc]
+
+# ===========================================================================
+# Node-level faults
+# ===========================================================================
+- name: Break the kubelet on c1-node-1
+  hosts: c1-node-1
+  gather_facts: false
+  tags: [kubelet]
+  tasks:
+    - name: Back up the working kubelet config
+      ansible.builtin.copy:
+        src: /var/lib/kubelet/config.yaml
+        dest: "{{ backup_dir }}/kubelet-config.yaml"
+        remote_src: true
+        mode: "0600"
+        force: false
+
+    - name: Append a malformed block to the kubelet config
+      # A plain append rather than blockinfile: no ANSIBLE MANAGED BLOCK
+      # marker to give the game away. The over-indented second key makes the
+      # file unparseable, so the kubelet fails on startup.
+      ansible.builtin.shell: |
+        grep -q 'imagefs.available' /var/lib/kubelet/config.yaml || cat >> /var/lib/kubelet/config.yaml <<'EOF'
+        evictionHard:
+          memory.available: "100Mi"
+            imagefs.available: "15%"
+        EOF
+      args: {executable: /bin/bash}
+      changed_when: true
+
+    - name: Restart the kubelet so it picks up the broken config
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+      failed_when: false
+
+    - name: Give the node time to go NotReady
+      ansible.builtin.pause:
+        seconds: 45
+
+- name: Re-arm the version skew on the upgrade target
+  hosts: c1-node-2          # must be literal: `hosts` is parsed before group_vars load
+  gather_facts: false
+  tags: [skew, never]
+  tasks:
+    # kube_packages already installs the oldest patch on this node during
+    # site.yml. This play exists so the task can be re-armed after a candidate
+    # has completed the upgrade. It is tagged `never`, so it only runs when
+    # you ask for it explicitly: ansible-playbook break.yml -t skew
+    - name: Resolve the oldest available patch in the stream
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache madison kubeadm | awk '{print $3}' | tail -1
+      args: {executable: /bin/bash}
+      register: _old_ver
+      changed_when: false
+
+    - name: Unhold the packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop: [kubeadm, kubelet, kubectl]
+
+    - name: Downgrade kubeadm, kubelet and kubectl
+      ansible.builtin.apt:
+        name:
+          - "kubeadm={{ _old_ver.stdout | trim }}"
+          - "kubelet={{ _old_ver.stdout | trim }}"
+          - "kubectl={{ _old_ver.stdout | trim }}"
+        state: present
+        allow_downgrade: true
+        allow_change_held_packages: true
+
+    - name: Re-hold the packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubeadm, kubelet, kubectl]
+
+    - name: Restart the kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+
+# ===========================================================================
+# LAST: break the cluster-2 API server
+# ===========================================================================
+- name: Break the cluster-2 API server
+  hosts: cluster2_cp
+  gather_facts: false
+  tags: [apiserver]
+  tasks:
+    - name: Back up the working manifest
+      ansible.builtin.copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+        dest: "{{ backup_dir }}/kube-apiserver.yaml"
+        remote_src: true
+        mode: "0600"
+        force: false
+
+    - name: Point --client-ca-file at a file that does not exist
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '--client-ca-file=/etc/kubernetes/pki/ca\.crt'
+        replace: '--client-ca-file=/etc/kubernetes/pki/ca-backup.crt'
+
+    - name: Wait for the API server to stop answering
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ node_ip }}"
+        state: stopped
+        timeout: 180
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "cluster-2 API server is down. Task 1 is armed."
+          - "The exam is ready. Open exam/MOCK_EXAM.md and start your timer."
