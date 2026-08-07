@@ -14,8 +14,8 @@ set -uo pipefail
 export KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
 ANSWER_DIR="${ANSWER_DIR:-/opt/cka}"
 
-K1="kubectl --context cluster-1"
-K2="kubectl --context cluster-2"
+K1="kubectl --context cluster-1-admin@cluster-1"
+K2="kubectl --context cluster-2-admin@cluster-2"
 
 TOTAL=0
 EARNED=0
