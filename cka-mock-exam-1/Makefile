@@ -1,6 +1,12 @@
 .PHONY: help infra cluster setup arm exam reset grade destroy all
 
-TF := terraform -chdir=terraform
+TF_BIN := $(shell command -v tofu 2> /dev/null || command -v terraform 2> /dev/null)
+
+ifeq ($(TF_BIN),)
+$(error "Neither terraform nor tofu found in PATH. Please install one of them.")
+endif
+
+TF := $(TF_BIN) -chdir=terraform
 AP := ansible-playbook
 
 help:
