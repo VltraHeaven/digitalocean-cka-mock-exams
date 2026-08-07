@@ -12,6 +12,7 @@
 
 # Kubernetes
 **/kubeconfig
+**/etc_hosts_fragment
 
 # General
 .DS_Store
