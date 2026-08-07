@@ -1,0 +1,165 @@
+---
+# ---------------------------------------------------------------------------
+# Helm (Task 4)
+# ---------------------------------------------------------------------------
+- name: Check for an existing Helm binary
+  ansible.builtin.command: helm version --short
+  register: _helm_check
+  changed_when: false
+  failed_when: false
+
+- name: Install Helm
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+      | bash
+  args:
+    executable: /bin/bash
+  when: _helm_check.rc != 0
+  changed_when: true
+  retries: 3
+  delay: 10
+
+- name: Enable Helm shell completion
+  ansible.builtin.shell: helm completion bash > /etc/bash_completion.d/helm
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# metrics-server (Tasks 17B, and `kubectl top` generally)
+# ---------------------------------------------------------------------------
+- name: Resolve the latest metrics-server release
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/kubernetes-sigs/metrics-server/releases/latest
+    return_content: true
+  register: _ms_release
+  when: metrics_server_version | length == 0
+  retries: 3
+  delay: 5
+
+- name: Set the metrics-server version
+  ansible.builtin.set_fact:
+    _ms_ver: "{{ metrics_server_version if metrics_server_version | length > 0 else _ms_release.json.tag_name }}"
+
+- name: Install metrics-server
+  ansible.builtin.command: >-
+    kubectl apply -f
+    https://github.com/kubernetes-sigs/metrics-server/releases/download/{{ _ms_ver }}/components.yaml
+  environment: {KUBECONFIG: /root/.kube/config}
+  changed_when: true
+  retries: 3
+  delay: 10
+  register: _ms_apply
+  until: _ms_apply is succeeded
+
+# Node kubelets present certificates signed by the cluster CA but without the
+# node IP as a SAN in this topology, so metrics-server cannot verify them.
+# --kubelet-insecure-tls is standard for labs; never do this in production.
+- name: Allow metrics-server to skip kubelet certificate verification
+  ansible.builtin.command: >-
+    kubectl patch deployment metrics-server -n kube-system --type=json
+    -p=[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]
+  environment: {KUBECONFIG: /root/.kube/config}
+  changed_when: true
+  failed_when: false
+
+- name: Wait for metrics-server to become available
+  ansible.builtin.command: >-
+    kubectl wait --for=condition=Available deployment/metrics-server
+    -n kube-system --timeout=300s
+  environment: {KUBECONFIG: /root/.kube/config}
+  changed_when: false
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Gateway API (Task 12) — cluster-2 only
+# ---------------------------------------------------------------------------
+- name: Gateway API setup
+  when: cluster_name == 'cluster-2'
+  block:
+    - name: Resolve the latest Gateway API release
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/kubernetes-sigs/gateway-api/releases/latest
+        return_content: true
+      register: _gw_release
+      when: gateway_api_version | length == 0
+      retries: 3
+      delay: 5
+
+    - name: Set the Gateway API version
+      ansible.builtin.set_fact:
+        _gw_ver: "{{ gateway_api_version if gateway_api_version | length > 0 else _gw_release.json.tag_name }}"
+
+    - name: Install the Gateway API standard channel CRDs
+      ansible.builtin.command: >-
+        kubectl apply -f
+        https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ _gw_ver }}/standard-install.yaml
+      environment: {KUBECONFIG: /root/.kube/config}
+      changed_when: true
+      retries: 3
+      delay: 10
+      register: _gw_apply
+      until: _gw_apply is succeeded
+
+    # A controller is optional. Without one the Gateway and HTTPRoute still
+    # validate against the API server, which is what Task 12 grades. With one,
+    # status conditions populate and the answer key's `describe httproute`
+    # check becomes meaningful.
+    - name: Install NGINX Gateway Fabric as the Gateway controller
+      ansible.builtin.shell: |
+        set -o pipefail
+        helm upgrade --install ngf \
+          oci://ghcr.io/nginx/charts/nginx-gateway-fabric \
+          --create-namespace -n nginx-gateway \
+          --set nginxGateway.gatewayClassName={{ gateway_class_name }} \
+          --wait --timeout 5m
+      args:
+        executable: /bin/bash
+      environment: {KUBECONFIG: /root/.kube/config}
+      when: install_gateway_controller | bool
+      changed_when: true
+      register: _ngf
+      failed_when: false
+
+    - name: Warn if the Gateway controller did not install
+      ansible.builtin.debug:
+        msg: >-
+          NGINX Gateway Fabric failed to install. Task 12 still works — the
+          Gateway and HTTPRoute will validate but will not receive status
+          conditions or a live address. Set install_gateway_controller=false
+          to silence this.
+      when:
+        - install_gateway_controller | bool
+        - _ngf.rc is defined and _ngf.rc != 0
+
+    - name: Ensure the exam GatewayClass exists
+      ansible.builtin.shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: GatewayClass
+        metadata:
+          name: {{ gateway_class_name }}
+        spec:
+          controllerName: gateway.nginx.org/nginx-gateway-controller
+        EOF
+      args:
+        executable: /bin/bash
+      environment: {KUBECONFIG: /root/.kube/config}
+      changed_when: true
+
+# ---------------------------------------------------------------------------
+# Node labels and taints (Task 7) — cluster-1 only
+# ---------------------------------------------------------------------------
+- name: Scheduling constraints for Task 7
+  when: cluster_name == 'cluster-1'
+  block:
+    - name: Label c1-node-2 as a GPU node
+      ansible.builtin.command: >-
+        kubectl label node c1-node-2 accelerator=nvidia --overwrite
+      environment: {KUBECONFIG: /root/.kube/config}
+      changed_when: false
+
+    - name: Taint c1-node-2
+      ansible.builtin.command: >-
+        kubectl taint node c1-node-2 hardware=gpu:NoSchedule --overwrite
+      environment: {KUBECONFIG: /root/.kube/config}
+      changed_when: false

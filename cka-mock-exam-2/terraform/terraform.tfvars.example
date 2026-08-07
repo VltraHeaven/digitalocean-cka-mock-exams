@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars and fill in.
+#   cp terraform.tfvars.example terraform.tfvars
+
+do_token     = "dop_v1_REPLACE_ME"
+ssh_key_name = "my-laptop"                  # doctl compute ssh-key list
+
+ssh_private_key_path = "~/.ssh/id_ed25519"
+region               = "nyc3"
+
+# Current LTS. If your region has not published it yet, use "ubuntu-24-04-x64".
+#   doctl compute image list-distribution --public | grep -i ubuntu
+ubuntu_image = "ubuntu-26-04-x64"
+
+control_plane_size = "s-2vcpu-4gb"
+worker_size        = "s-2vcpu-2gb"
+
+cluster1_worker_count = 2
+cluster2_worker_count = 1
+
+# Leave empty to autodetect your public /32. Set explicitly if you are behind
+# a rotating IP or a corporate egress range.
+# allowed_ssh_cidrs = ["203.0.113.44/32"]

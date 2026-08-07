@@ -1,0 +1,54 @@
+---
+# Injects the Exam 2 faults.
+
+# ===========================================================================
+# cluster-1 faults
+# ===========================================================================
+- name: cluster-1 faults
+  hosts: cluster1_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    # ---- Task 1: Restore the cluster-1 Scheduler --------------------------
+    - name: Break the cluster-1 scheduler
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/kube-scheduler.yaml
+        regexp: 'kube-scheduler --bind-address=127.0.0.1'
+        replace: 'kube-scheduler --bind-address=127.0.0.1 --port=0 --invalid-flag'
+      tags: [scheduler]
+
+    - name: Wait for the scheduler to stop
+      ansible.builtin.shell: |
+        kubectl --context cluster-1-admin@cluster-1 get pods -n kube-system -l component=kube-scheduler -o jsonpath='{.items[0].status.phase}' | grep -v Running || true
+      register: _sched_status
+      until: _sched_status.stdout != "Running"
+      retries: 20
+      delay: 5
+      tags: [scheduler]
+
+# ===========================================================================
+# cluster-2 faults
+# ===========================================================================
+- name: cluster-2 faults
+  hosts: c2-node-1
+  gather_facts: false
+  tasks:
+    # ---- Task 9: Troubleshooting: Kubelet Service -------------------------
+    - name: Stop the kubelet on c2-node-1
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+      tags: [kubelet]
+
+- name: Report
+  hosts: cluster1_cp
+  gather_facts: false
+  tasks:
+    - name: Final report
+      ansible.builtin.debug:
+        msg:
+          - "Exam 2 is ready."
+          - "cluster-1 scheduler is broken (Task 1)."
+          - "c2-node-1 kubelet is stopped (Task 9)."
+          - "data-worker deployment is in CrashLoopBackOff (Task 17)."

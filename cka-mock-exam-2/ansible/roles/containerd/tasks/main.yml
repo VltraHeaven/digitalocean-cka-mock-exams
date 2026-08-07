@@ -1,0 +1,64 @@
+---
+- name: Install containerd and runc
+  ansible.builtin.apt:
+    name:
+      - containerd
+      - runc
+    state: present
+    update_cache: true
+  register: _ctr_install
+  retries: 3
+  delay: 10
+  until: _ctr_install is succeeded
+
+- name: Ensure the containerd config directory exists
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: "0755"
+
+- name: Check whether a generated config already exists
+  ansible.builtin.stat:
+    path: /etc/containerd/config.toml
+  register: _ctr_conf
+
+- name: Generate the default containerd configuration
+  ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+  when: not _ctr_conf.stat.exists or _ctr_conf.stat.size < 512
+  changed_when: true
+
+# The SystemdCgroup key sits under different plugin paths in containerd 1.x
+# (io.containerd.grpc.v1.cri) and 2.x (io.containerd.cri.v1.runtime), but the
+# key name itself is stable, so a plain substitution is version-agnostic.
+# It must be true: the kubelet defaults to the systemd cgroup driver, and a
+# mismatch produces pods that start and then die under memory pressure.
+- name: Set the systemd cgroup driver
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup\s*=\s*false'
+    replace: 'SystemdCgroup = true'
+  when: containerd_cgroup_systemd | bool
+  notify: Restart containerd
+
+- name: Confirm SystemdCgroup ended up enabled
+  ansible.builtin.command: grep -c 'SystemdCgroup = true' /etc/containerd/config.toml
+  register: _cgroup_check
+  changed_when: false
+  failed_when: _cgroup_check.stdout | int < 1
+
+- name: Enable and start containerd
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Point crictl at the containerd socket
+  ansible.builtin.copy:
+    dest: /etc/crictl.yaml
+    mode: "0644"
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false

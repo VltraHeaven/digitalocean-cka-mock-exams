@@ -1,0 +1,64 @@
+---
+# Builds two kubeadm clusters from bare Ubuntu droplets.
+#   ansible-playbook site.yml
+#
+# Idempotent: safe to re-run. Roughly 12-15 minutes on the default sizes.
+
+- name: Prepare every node
+  hosts: all
+  gather_facts: true
+  roles:
+    - common
+    - containerd
+    - kube_packages
+
+- name: Initialise control planes
+  hosts: control_planes
+  gather_facts: false
+  roles:
+    - control_plane
+
+- name: Join workers
+  hosts: workers
+  gather_facts: false
+  serial: 1
+  roles:
+    - worker
+
+- name: Install addons and apply node scheduling constraints
+  hosts: control_planes
+  gather_facts: false
+  roles:
+    - addons
+
+- name: Assemble the multi-cluster kubeconfig
+  hosts: 
+    - cluster1_cp
+    - cluster2_cp
+  gather_facts: false
+  roles:
+    - kubeconfig
+
+- name: Summary
+  hosts: cluster1_cp
+  gather_facts: false
+  tasks:
+    - name: Show cluster state
+      ansible.builtin.shell: |
+        echo "--- cluster-1 ---"; kubectl --context cluster-1-admin@cluster-1 get nodes -o wide
+        echo "--- cluster-2 ---"; kubectl --context cluster-2-admin@cluster-2 get nodes -o wide
+      args: {executable: /bin/bash}
+      environment: {KUBECONFIG: /root/.kube/config}
+      register: _summary
+      changed_when: false
+
+    - name: Print
+      ansible.builtin.debug:
+        msg: "{{ _summary.stdout_lines }}"
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - "Clusters are up. Now run:"
+          - "  ansible-playbook exam-setup.yml   # healthy prerequisites"
+          - "  ansible-playbook break.yml        # inject the exam faults"

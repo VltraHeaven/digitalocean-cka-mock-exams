@@ -1,0 +1,52 @@
+---
+# Restores any broken component to its healthy state.
+
+- name: Restore the cluster-1 scheduler
+  hosts: cluster1_cp
+  gather_facts: false
+  tags: [scheduler]
+  tasks:
+    - name: Repair the scheduler flag
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/kube-scheduler.yaml
+        regexp: 'kube-scheduler --bind-address=127.0.0.1 --port=0 --invalid-flag'
+        replace: 'kube-scheduler --bind-address=127.0.0.1'
+      changed_when: true
+
+    - name: Wait for the scheduler to answer again
+      ansible.builtin.shell: |
+        kubectl --context cluster-1-admin@cluster-1 get pods -n kube-system -l component=kube-scheduler -o jsonpath='{.items[0].status.phase}' | grep Running
+      register: _sched_status
+      until: _sched_status.rc == 0
+      retries: 20
+      delay: 5
+
+- name: Restore the kubelet on c2-node-1
+  hosts: c2-node-1
+  gather_facts: false
+  tags: [kubelet]
+  tasks:
+    - name: Start the kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: true
+
+    - name: Wait for the kubelet to be Ready
+      ansible.builtin.command: systemctl is-active kubelet
+      register: _kact
+      until: _kact.stdout == "active"
+      retries: 12
+      delay: 5
+
+- name: Cleanup cluster objects
+  hosts: cluster1_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Clear recorded answers
+      ansible.builtin.file:
+        path: "{{ exam_answer_dir }}"
+        state: absent
+      tags: [scoring]

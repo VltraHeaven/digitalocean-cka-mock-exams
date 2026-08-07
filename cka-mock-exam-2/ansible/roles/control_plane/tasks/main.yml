@@ -1,0 +1,134 @@
+---
+- name: Check whether this control plane is already initialised
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: _admin_conf
+
+- name: Render the kubeadm init configuration
+  ansible.builtin.copy:
+    dest: /root/kubeadm-init.yaml
+    mode: "0600"
+    content: |
+      apiVersion: kubeadm.k8s.io/v1beta4
+      kind: InitConfiguration
+      localAPIEndpoint:
+        advertiseAddress: {{ node_ip }}
+        bindPort: 6443
+      nodeRegistration:
+        name: {{ inventory_hostname }}
+        criSocket: unix:///run/containerd/containerd.sock
+        kubeletExtraArgs:
+          - name: node-ip
+            value: {{ node_ip }}
+      ---
+      apiVersion: kubeadm.k8s.io/v1beta4
+      kind: ClusterConfiguration
+      clusterName: {{ cluster_name }}
+      kubernetesVersion: stable-{{ kube_stream }}
+      controlPlaneEndpoint: "{{ node_ip }}:6443"
+      networking:
+        podSubnet: {{ pod_cidr }}
+        serviceSubnet: {{ service_cidr }}
+      apiServer:
+        # The public address is added as a SAN so a kubeconfig fetched to your
+        # laptop can talk to the API server without certificate errors.
+        certSANs:
+          - {{ node_ip }}
+          - {{ ansible_host }}
+          - {{ inventory_hostname }}
+          - 127.0.0.1
+          - localhost
+      ---
+      apiVersion: kubelet.config.k8s.io/v1beta1
+      kind: KubeletConfiguration
+      cgroupDriver: systemd
+  when: not _admin_conf.stat.exists
+
+- name: Pre-pull control plane images
+  ansible.builtin.command: kubeadm config images pull --config /root/kubeadm-init.yaml
+  when: not _admin_conf.stat.exists
+  changed_when: true
+  retries: 2
+  delay: 15
+  register: _pull
+  until: _pull is succeeded
+
+- name: Run kubeadm init
+  ansible.builtin.command: kubeadm init --config /root/kubeadm-init.yaml --upload-certs
+  when: not _admin_conf.stat.exists
+  changed_when: true
+  register: _kubeadm_init
+
+- name: Install the admin kubeconfig for root
+  block:
+    - name: Create /root/.kube
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+
+    - name: Copy admin.conf into place
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        mode: "0600"
+
+# ---------------------------------------------------------------------------
+# CNI — Calico, not Flannel.
+# Tasks 10 and 12 require a CNI that actually enforces NetworkPolicy. Flannel
+# accepts NetworkPolicy objects and silently ignores them, which would make
+# every policy exercise appear to pass while enforcing nothing.
+# ---------------------------------------------------------------------------
+- name: Resolve the latest Calico release
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/projectcalico/calico/releases/latest
+    return_content: true
+  register: _calico_release
+  when: calico_version | length == 0
+  retries: 3
+  delay: 5
+
+- name: Set the Calico version
+  ansible.builtin.set_fact:
+    _calico_ver: "{{ calico_version if calico_version | length > 0 else _calico_release.json.tag_name }}"
+
+- name: Check whether Calico is already installed
+  ansible.builtin.command: kubectl get daemonset calico-node -n kube-system
+  environment: {KUBECONFIG: /root/.kube/config}
+  register: _calico_present
+  changed_when: false
+  failed_when: false
+
+- name: Apply the Calico manifest
+  ansible.builtin.command: >-
+    kubectl apply -f
+    https://raw.githubusercontent.com/projectcalico/calico/{{ _calico_ver }}/manifests/calico.yaml
+  environment: {KUBECONFIG: /root/.kube/config}
+  when: _calico_present.rc != 0
+  changed_when: true
+  retries: 3
+  delay: 10
+  register: _calico_apply
+  until: _calico_apply is succeeded
+
+- name: Wait for the control plane node to report Ready
+  ansible.builtin.command: >-
+    kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+  environment: {KUBECONFIG: /root/.kube/config}
+  changed_when: false
+
+- name: Generate a worker join command
+  ansible.builtin.command: kubeadm token create --print-join-command --ttl 4h
+  register: _join_cmd
+  changed_when: false
+
+- name: Publish the join command to the workers in this cluster
+  ansible.builtin.set_fact:
+    kube_join_command: "{{ _join_cmd.stdout | trim }}"
+
+- name: Create the answer directory used by several exam tasks
+  ansible.builtin.file:
+    path: "{{ exam_answer_dir }}"
+    state: directory
+    mode: "0755"

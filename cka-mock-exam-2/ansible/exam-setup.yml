@@ -1,0 +1,57 @@
+---
+# Creates everything the exam expects to find already working.
+# Run after site.yml, before break.yml.
+
+- name: cluster-1 prerequisites
+  hosts: cluster1_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Stage the cluster-1 manifests
+      ansible.builtin.copy:
+        src: cluster1-setup.yaml
+        dest: /root/cluster1-setup.yaml
+        mode: "0644"
+
+    - name: Apply the cluster-1 manifests
+      ansible.builtin.command: kubectl --context cluster-1-admin@cluster-1 apply -f /root/cluster1-setup.yaml
+      changed_when: true
+
+    - name: Create the answer directory
+      ansible.builtin.file:
+        path: "{{ exam_answer_dir }}"
+        state: directory
+        mode: "0755"
+
+- name: cluster-2 prerequisites
+  hosts: cluster2_cp
+  gather_facts: false
+  environment:
+    KUBECONFIG: /root/.kube/config
+  tasks:
+    - name: Stage the cluster-2 manifests
+      ansible.builtin.copy:
+        src: cluster2-setup.yaml
+        dest: /root/cluster2-setup.yaml
+        mode: "0644"
+
+    - name: Apply the cluster-2 manifests
+      ansible.builtin.command: kubectl --context cluster-2-admin@cluster-2 apply -f /root/cluster2-setup.yaml
+      changed_when: true
+
+    - name: Create the answer directory
+      ansible.builtin.file:
+        path: "{{ exam_answer_dir }}"
+        state: directory
+        mode: "0755"
+
+- name: Confirm the lab is armed
+  hosts: cluster1_cp
+  gather_facts: false
+  tasks:
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Exam 2 prerequisites are in place."
+          - "Now inject the faults:  ansible-playbook break.yml"
